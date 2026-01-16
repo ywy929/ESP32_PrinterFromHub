@@ -10,9 +10,11 @@
 6. [Timestamp & Formatting](#timestamp--formatting)
 7. [Bluetooth Connection Management](#bluetooth-connection-management)
 8. [Button Operation Modes](#button-operation-modes)
-9. [Code Flow](#code-flow)
-10. [Configuration Parameters](#configuration-parameters)
-11. [Troubleshooting](#troubleshooting)
+9. [Config Mode (BLE)](#config-mode-ble)
+10. [Persistent Storage](#persistent-storage)
+11. [Code Flow](#code-flow)
+12. [Configuration Parameters](#configuration-parameters)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -25,8 +27,10 @@ The Printer ESP32 is the output module in the weighing scale system. It receives
 - **UART Input**: Receives print-ready data from Hub ESP32
 - **RTC Timestamping**: DS3231 module for accurate date/time stamps
 - **Bluetooth Output**: Supports thermal and dot-matrix printers
-- **Bypass Mode**: Button to skip timestamp for quick prints
-- **Auto-Reconnect**: Maintains Bluetooth connection reliability
+- **Bypass Mode**: Latched button to skip timestamp for quick prints
+- **Auto-Reconnect**: Non-blocking FreeRTOS task maintains Bluetooth connection
+- **BLE Config Mode**: Configure RTC time, printer MAC, and printer type via mobile app
+- **Persistent Settings**: MAC address and printer type stored in NVS flash
 
 ---
 
@@ -59,11 +63,11 @@ The Printer ESP32 is the output module in the weighing scale system. It receives
                     │  ┌──────────┐    ┌──────────────────┐ │
                     │  │  DS3231  │    │                  │ │
                     │  │   RTC    │    │  Bluetooth       │ │      ┌──────────┐
-                    │  └──────────┘    │  Serial          │─┼─────►│ Thermal  │
+                    │  └──────────┘    │  Classic/BLE     │─┼─────►│ Thermal  │
                     │                  │                  │ │      │ Printer  │
                     │  ┌──────────┐    └──────────────────┘ │      └──────────┘
-                    │  │  Button  │                         │            or
-                    │  │ (Bypass) │                         │      ┌──────────┐
+                    │  │  Latched │                         │            or
+                    │  │  Button  │                         │      ┌──────────┐
                     │  └──────────┘                         │      │Dotmatrix │
                     │                                       │      │ Printer  │
                     └───────────────────────────────────────┘      └──────────┘
@@ -76,40 +80,52 @@ The Printer ESP32 is the output module in the weighing scale system. It receives
 | Hub ESP32 | Detect print button, send data to Printer ESP32 |
 | **Printer ESP32** | Add timestamp, format output, send to Bluetooth printer |
 | RTC (DS3231) | Provide accurate date/time for receipts |
-| Bluetooth | Wireless connection to physical printer |
+| Bluetooth Classic | Wireless connection to physical printer |
+| BLE | Configuration via mobile app (Nordic UART Service) |
 
 ---
 
 ## Hardware Configuration
 
-### Pin Assignments
+### PCB Header Swap Issue
+
+**IMPORTANT**: The PCB has left/right headers swapped. Pin remapping is done in software:
+
+| Original GPIO | Remapped GPIO | Function | Notes |
+|---------------|---------------|----------|-------|
+| 25 | 5 | LED_PIN | Software fixable |
+| 26 | 17 | BUTTON_PIN | Software fixable |
+| 16 | 27 | HUB_RX (UART) | Software fixable |
+| 22 | 36 | I2C SCL | INPUT ONLY - needs bodge wire |
+| 21 | 35 | I2C SDA | INPUT ONLY - needs bodge wire |
+
+### Pin Assignments (After Remapping)
 
 | GPIO | Function | Direction | Description |
 |------|----------|-----------|-------------|
-| 16 | HUB_RX | Input | UART1 RX - Data from Hub ESP32 (GPIO 19) |
-| 25 | LED_PIN | Output | Status LED (PWM controlled) |
-| 26 | BUTTON_PIN | Input | Timestamp bypass button (active LOW) |
-| 21 | I2C SDA | Bidirectional | RTC data line |
-| 22 | I2C SCL | Output | RTC clock line |
+| 27 | HUB_RX | Input | UART1 RX - Data from Hub ESP32 |
+| 5 | LED_PIN | Output | Status LED (simple on/off) |
+| 17 | BUTTON_PIN | Input | Config mode toggle / Timestamp bypass (latched, active LOW) |
+| 21 | I2C SDA | Bidirectional | RTC data line (requires bodge wire) |
+| 22 | I2C SCL | Output | RTC clock line (requires bodge wire) |
 
-### PWM Configuration (LED)
+### LED Configuration
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| LED_CHANNEL | 0 | LEDC channel number |
-| LED_FREQ | 5000 Hz | PWM frequency |
-| LED_RESOLUTION | 8-bit | 0-255 brightness range |
-| LED_BRIGHTNESS | 60 | ~25% brightness (60/255) |
+| State | Meaning |
+|-------|---------|
+| OFF | Not connected to printer |
+| ON (solid) | Connected to printer |
+| Fast blink (100ms) | Config mode active |
 
 ### Wiring Diagram
 
 ```
                                     ┌─────────────────────┐
                                     │    Printer ESP32    │
-                                    │                     │
+                                    │   (Headers Swapped) │
     From Hub ESP32                  │                     │
     ┌──────────┐                    │  ┌───────────────┐  │
-    │ GPIO 19  │───────────────────►│──│ GPIO 16 (RX)  │  │
+    │ GPIO 19  │───────────────────►│──│ GPIO 27 (RX)  │  │
     │   (TX)   │                    │  └───────────────┘  │
     └──────────┘                    │                     │
     ┌──────────┐                    │  ┌───────────────┐  │
@@ -118,20 +134,20 @@ The Printer ESP32 is the output module in the weighing scale system. It receives
                                     │                     │
     DS3231 RTC Module               │                     │
     ┌──────────┐                    │  ┌───────────────┐  │
-    │   SDA    │◄──────────────────►│──│ GPIO 21 (SDA) │  │
-    │   SCL    │◄───────────────────│──│ GPIO 22 (SCL) │  │
+    │   SDA    │◄──────────────────►│──│ GPIO 21 (SDA) │  │  ← Bodge wire needed
+    │   SCL    │◄───────────────────│──│ GPIO 22 (SCL) │  │  ← Bodge wire needed
     │   VCC    │◄───────────────────│──│     3.3V      │  │
     │   GND    │◄───────────────────│──│     GND       │  │
     └──────────┘                    │  └───────────────┘  │
                                     │                     │
-    Bypass Button                   │  ┌───────────────┐  │
-    ┌──────────┐                    │  │ GPIO 26       │  │
-    │    NO    │────────────────────│──│ (INPUT_PULLUP)│  │
-    │   COM    │────────────────────│──│     GND       │  │
+    Latched Button (Toggle Switch)  │  ┌───────────────┐  │
+    ┌──────────┐                    │  │ GPIO 17       │  │
+    │  Common  │────────────────────│──│ (INPUT_PULLUP)│  │
+    │   Pole   │────────────────────│──│     GND       │  │
     └──────────┘                    │  └───────────────┘  │
                                     │                     │
     Status LED                      │  ┌───────────────┐  │
-    ┌──────────┐                    │  │ GPIO 25       │  │
+    ┌──────────┐                    │  │ GPIO 5        │  │
     │  Anode   │◄───[330Ω]──────────│──│   (OUTPUT)    │  │
     │ Cathode  │────────────────────│──│     GND       │  │
     └──────────┘                    │  └───────────────┘  │
@@ -146,7 +162,7 @@ The Printer ESP32 is the output module in the weighing scale system. It receives
 | UART | Baud Rate | Config | Purpose |
 |------|-----------|--------|---------|
 | Serial | 9600 | 8N1 | Debug output (USB) |
-| Serial1 | 9600 | 8N1 | RX only from Hub ESP32 |
+| Serial1 | 9600 | 8N1 | RX only from Hub ESP32 (GPIO 27) |
 
 ### I2C Configuration
 
@@ -156,6 +172,8 @@ The Printer ESP32 is the output module in the weighing scale system. It receives
 | RTC Address | 0x68 |
 | Pull-ups | External 4.7kΩ (on DS3231 module) |
 
+**Note**: GPIO 35/36 are input-only on ESP32. If using swapped headers, I2C requires hardware bodge wires to GPIO 21/22.
+
 ---
 
 ## Communication Interfaces
@@ -164,6 +182,7 @@ The Printer ESP32 is the output module in the weighing scale system. It receives
 
 **Connection**: One-way (RX only)
 **Baud Rate**: 9600
+**GPIO**: 27 (remapped from 16)
 **Format**: ASCII string terminated with `\n`
 
 **Expected Data Format**:
@@ -171,37 +190,42 @@ The Printer ESP32 is the output module in the weighing scale system. It receives
  *     123.45 g\n      ← 16-char LCD-formatted weight
 ```
 
-**Data Flow**:
-```
-Hub ESP32 (GPIO 19 TX) ──────► Printer ESP32 (GPIO 16 RX)
-                │
-                └─► Serial1.available()
-                    Serial1.readStringUntil('\n')
-```
-
-### Bluetooth Output (to Printer)
+### Bluetooth Classic Output (to Printer)
 
 **Mode**: Master (ESP32 initiates connection)
 **Protocol**: Bluetooth Classic SPP (Serial Port Profile)
 **PIN**: Configurable (default "0000")
 
 **Supported Printers**:
-| Type | Characteristics |
-|------|-----------------|
-| Thermal | Fast, quiet, uses `\x1B\x64\x02` for paper feed |
-| Dot-matrix | Slower, louder, may ignore ESC commands |
+| Type | Value | Paper Feed | Buffer Flush |
+|------|-------|------------|--------------|
+| THERMAL | 0 | 3 lines | ESC J 0 needed |
+| DOT | 1 | 12 lines | Not needed |
 
 **Connection Parameters**:
 ```cpp
-uint8_t printerBtAddress[6] = {0xDC, 0x0D, 0x30, 0x00, 0x28, 0x89};
+uint8_t printerBtAddress[6] = {0xDC, 0x0D, 0x30, 0x00, 0x28, 0x89};  // Loaded from NVS
 const char* btPin = "0000";
+uint8_t printerType = 0;  // 0=THERMAL, 1=DOT (Loaded from NVS)
 ```
 
-**Reconnection Settings**:
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Reconnect interval | 5000ms | Time between reconnection attempts |
-| Connection timeout | 5000ms | SerialBT.connected() timeout |
+### BLE Configuration Interface (Nordic UART Service)
+
+**Mode**: Server (ESP32 advertises, phone connects)
+**Service**: Nordic UART Service (NUS)
+
+**UUIDs**:
+```cpp
+SERVICE_UUID:           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+CHARACTERISTIC_UUID_RX: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // Phone → ESP32
+CHARACTERISTIC_UUID_TX: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // ESP32 → Phone
+```
+
+**Compatible Apps**:
+- LightBlue (iOS/Android)
+- nRF Connect (iOS/Android)
+
+**Important**: BLE and Bluetooth Classic cannot run simultaneously on ESP32. Config mode stops Bluetooth Classic before starting BLE.
 
 ---
 
@@ -251,61 +275,20 @@ const char* btPin = "0000";
 
 ### String Filtering
 
-Certain strings are filtered out to avoid printing unwanted content:
-
 | Filtered String | Reason |
 |-----------------|--------|
 | `------------------------` | Separator line (printed by formatter) |
 | `........................` | Signature line (printed by formatter) |
 | `Signature` | Label (printed by formatter) |
-
-**Special Handling**:
-| String | Action |
-|--------|--------|
 | `NO STABILITY` | Silently ignored (no print output) |
-
-### Filter Logic
-
-```cpp
-void printWithTimestamp(const char* data) {
-    String strData = String(data);
-    strData.trim();
-    
-    // Filter out formatting strings
-    if (strData == "------------------------") return;
-    if (strData == "........................") return;
-    if (strData == "Signature") return;
-    
-    // Silently ignore unstable readings
-    if (strData == "NO STABILITY") {
-        return;
-    }
-    
-    // Continue with normal print...
-}
-```
 
 ---
 
 ## Timestamp & Formatting
 
-### RTC Time Retrieval
-
-```cpp
-rtc.refresh();  // Must call before reading values
-
-int day    = rtc.day();      // 1-31
-int month  = rtc.month();    // 1-12
-int year   = rtc.year();     // 0-99 (20xx)
-int dow    = rtc.dayOfWeek();// 1-7 (Sunday=1)
-int hour   = rtc.hour();     // 0-23
-int minute = rtc.minute();   // 0-59
-int second = rtc.second();   // 0-59
-```
-
 ### Print Format Modes
 
-#### Mode 1: Full Receipt (Button Released)
+#### Mode 1: Full Receipt (Button Pressed/Latched - LOW)
 
 ```
 ┌────────────────────────────────────┐
@@ -315,48 +298,17 @@ int second = rtc.second();   // 0-59
 │                                    │  ← Blank line
 │ ------------------------           │  ← Separator
 │ ........................           │  ← Signature dots
-│                                    │  ← Paper feed
+│                                    │  ← Paper feed (3 or 12 lines)
 └────────────────────────────────────┘
 ```
 
-**Code**:
-```cpp
-if (digitalRead(BUTTON_PIN) == LOW) {  // Button pressed
-    // Print timestamp
-    SerialBT.print(rtc.day());
-    SerialBT.print('/');
-    SerialBT.print(rtc.month());
-    SerialBT.print('/');
-    SerialBT.print(rtc.year());
-    SerialBT.print(" (");
-    SerialBT.print(daysOfTheWeek[rtc.dayOfWeek() - 1]);
-    SerialBT.print(") ");
-    SerialBT.print(rtc.hour());
-    SerialBT.print(':');
-    if (rtc.minute() < 10) SerialBT.print('0');
-    SerialBT.print(rtc.minute());
-    SerialBT.print(':');
-    if (rtc.second() < 10) SerialBT.print('0');
-    SerialBT.println(rtc.second());
-    
-    // Print weight
-    SerialBT.println(strData);
-    
-    // Print receipt footer
-    SerialBT.println("Signature");
-    SerialBT.println("");
-    SerialBT.println("------------------------");
-    SerialBT.println("........................");
-    SerialBT.println("\x1B\x64\x0C");  // ESC d 12 = Feed 12 lines
-}
+**Paper Feed by Printer Type**:
+| Type | Command | Lines |
+|------|---------|-------|
+| THERMAL | `\x1B\x64\x03` | 3 lines |
+| DOT | `\x1B\x64\x0C` | 12 lines |
 
-// Blink LED to confirm print
-ledcWrite(LED_CHANNEL, 0);
-delay(100);
-ledcWrite(LED_CHANNEL, LED_BRIGHTNESS);
-```
-
-#### Mode 2: Quick Print (Button Pressed)
+#### Mode 2: Bypass Print (Button Not Pressed - HIGH)
 
 ```
 ┌────────────────────────────────────┐
@@ -364,32 +316,57 @@ ledcWrite(LED_CHANNEL, LED_BRIGHTNESS);
 └────────────────────────────────────┘
 ```
 
-**Code**:
-```cpp
-if (digitalRead(BUTTON_PIN) == HIGH) {  // Button pressed (grounded)
-    SerialBT.println(strData);  // Weight only, no timestamp
-}
-```
-
-### ESC/POS Commands
-
-| Command | Hex | Description |
-|---------|-----|-------------|
-| Paper Feed | `\x1B\x64\x0C` | ESC d 12 - Feed 12 lines (adjust for printer) |
-
-**Note**: The paper feed value (`0x0C` = 12 lines) may need adjustment based on your printer model.
+**Buffer Flush**: Uses `ESC J 0` (`{0x1B, 0x4A, 0x00}`) to flush print buffer without paper feed.
 
 ---
 
 ## Bluetooth Connection Management
 
+### Non-Blocking Reconnection (FreeRTOS)
+
+The reconnection uses a FreeRTOS background task to prevent blocking the main loop:
+
+```cpp
+void reconnectTask(void* parameter) {
+    Serial.println("Attempting Bluetooth reconnect...");
+
+    if (SerialBT.connect(printerBtAddress)) {
+        btConnected = true;
+        digitalWrite(LED_PIN, HIGH);
+        Serial.println("Bluetooth reconnected!");
+    } else {
+        Serial.println("Bluetooth reconnect failed");
+    }
+
+    reconnectInProgress = false;
+    vTaskDelete(NULL);  // Delete this task when done
+}
+
+void reconnectBluetooth() {
+    static unsigned long lastReconnectAttempt = 0;
+    static bool firstAttempt = true;
+    unsigned long now = millis();
+
+    // First attempt immediately, then every 10 seconds
+    unsigned long interval = firstAttempt ? 0 : 10000;
+    if (!reconnectInProgress && (now - lastReconnectAttempt >= interval)) {
+        firstAttempt = false;
+        lastReconnectAttempt = now;
+        reconnectInProgress = true;
+
+        xTaskCreate(reconnectTask, "BT_Reconnect", 4096, NULL, 1, NULL);
+    }
+}
+```
+
+**Benefits**:
+- Main loop remains responsive (button still works during reconnect)
+- SerialBT.connect() blocks for ~10 seconds - now runs in background
+- Task self-deletes when complete
+
 ### Connection State Machine
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Bluetooth Connection State Machine                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-
                          ┌─────────────────┐
                          │     STARTUP     │
                          └────────┬────────┘
@@ -402,13 +379,8 @@ if (digitalRead(BUTTON_PIN) == HIGH) {  // Button pressed (grounded)
                                   │
                                   ▼
                          ┌─────────────────┐
-                         │   Set PIN code  │
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │ Connect to      │
-                         │ printer MAC     │
+                         │ Background task │
+                         │ connects        │
                          └────────┬────────┘
                                   │
                     ┌─────────────┴─────────────┐
@@ -420,78 +392,23 @@ if (digitalRead(BUTTON_PIN) == HIGH) {  // Button pressed (grounded)
            └────────┬────────┘         └────────┬────────┘
                     │                           │
                     │◄──────────────────────────┘
-                    │        Reconnect attempt
-                    │         (in main loop)
+                    │        Reconnect task
+                    │        (every 10 seconds)
                     ▼
            ┌─────────────────┐
-           │  Check every    │
-           │  5000ms         │
-           └────────┬────────┘
-                    │
-         ┌──────────┴──────────┐
-         │ Still connected     │ Disconnected
-         ▼                     ▼
-    [Continue]          [Attempt reconnect]
+           │ Non-blocking    │
+           │ check in loop   │
+           │ connected(0)    │
+           └─────────────────┘
 ```
-
-### Reconnection Logic
-
-The reconnection is handled by a dedicated `reconnectBluetooth()` function with rate limiting:
-
-```cpp
-void reconnectBluetooth() {
-    static unsigned long lastReconnectAttempt = 0;
-    unsigned long now = millis();
-    
-    // Try reconnect every 5 seconds
-    if (now - lastReconnectAttempt >= 5000) {
-        lastReconnectAttempt = now;
-        Serial.println("Attempting Bluetooth reconnect...");
-        
-        if (SerialBT.connect(printerBtAddress)) {
-            btConnected = true;
-            ledcWrite(LED_CHANNEL, LED_BRIGHTNESS);
-            Serial.println("Bluetooth reconnected!");
-        }
-    }
-}
-```
-
-**Main Loop Connection Management**:
-```cpp
-void loop() {
-    // ... data handling ...
-    
-    if (!SerialBT.connected(5000)) {
-        if (btConnected) {
-            Serial.println("Bluetooth disconnected");
-            ledcWrite(LED_CHANNEL, 0);
-            btConnected = false;
-        }
-        reconnectBluetooth();
-    } else {
-        if (!btConnected) {
-            Serial.println("Bluetooth reconnected!");
-            ledcWrite(LED_CHANNEL, LED_BRIGHTNESS);
-            btConnected = true;
-        }
-    }
-}
-```
-
-### Connection Timeout Handling
-
-| Scenario | Timeout | Action |
-|----------|---------|--------|
-| Initial connect | None (blocking) | Wait until connected or fail |
-| Connection check | 5000ms | If no response, attempt reconnect |
-| Print while disconnected | Immediate | Skip print, log error |
 
 ---
 
 ## Button Operation Modes
 
 ### Physical Button Configuration
+
+The system uses a **latched button (toggle switch)**, not a momentary button.
 
 ```
               3.3V
@@ -502,51 +419,144 @@ void loop() {
          │  Pull-up  │
          └─────┬─────┘
                │
-    GPIO 26 ───┼─────────┐
+    GPIO 17 ───┼─────────┐
                │         │
                │       ──┴──
-               │       ─┬──   Momentary
-               │        │     Button (NO)
+               │       ─┬──   Latched
+               │        │     Toggle Switch
                │       ─┴─
                │        │
               GND ──────┘
 ```
 
-### Button States
+### Button Functions
 
-| Physical State | GPIO Reading | Print Mode |
-|----------------|--------------|------------|
-| Not pressed | HIGH (pulled up) | Quick print (weight only) |
-| Pressed | LOW (grounded) | Full receipt (timestamp + signature) |
+| Action | Result |
+|--------|--------|
+| Toggle ON (LOW) | Timestamp mode - full receipt with date/time |
+| Toggle OFF (HIGH) | Bypass mode - weight only |
+| Press 4 times in 4 seconds | Toggle config mode |
 
-**Note**: The logic is inverted for safety - the default (not pressed) mode gives the simpler output.
+### Config Mode Entry/Exit
 
-### Mode Selection Flow
+```cpp
+const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long PRESS_TIMEOUT = 4000;  // 4 seconds for 4 presses
 
+// 4 presses detected:
+if (buttonPressCount >= 4) {
+    buttonPressCount = 0;
+    if (configMode) {
+        exitConfigMode();   // Exit config, reconnect to printer
+    } else {
+        enterConfigMode();  // Enter config, start BLE
+    }
+}
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Button Mode Selection                                │
-└─────────────────────────────────────────────────────────────────────────────┘
 
-                    Print Request Received
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │ Read BUTTON_PIN │
-                    └────────┬────────┘
-                             │
-               ┌─────────────┴─────────────┐
-               │ HIGH                      │ LOW
-               │ (Not pressed)             │ (Pressed)
-               ▼                           ▼
-      ┌─────────────────┐         ┌─────────────────┐
-      │  BYPASS MODE    │         │  FULL RECEIPT   │
-      │                 │         │                 │
-      │ • Weight only   │         │ • Timestamp     │
-      │ • No timestamp  │         │ • Weight        │
-      │ • No signature  │         │ • Signature     │
-      │ • Fast          │         │ • Separator     │
-      └─────────────────┘         └─────────────────┘
+---
+
+## Config Mode (BLE)
+
+### Entry Methods
+1. Press button 4 times within 4 seconds
+
+### Exit Methods
+1. Press button 4 times within 4 seconds
+2. Send "EXIT", "X", or "Q" command via BLE
+
+### BLE Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `TIME YY/MM/DD HH:MM:SS DOW` | Set RTC time (DOW = day of week 1-7) | `TIME 25/01/17 14:30:00 6` |
+| `MAC XX:XX:XX:XX:XX:XX` | Set printer Bluetooth MAC address | `MAC DC:0D:30:00:28:89` |
+| `TYPE THERMAL` or `TYPE DOT` | Set printer type (also: T, D, 0, 1) | `TYPE THERMAL` |
+| `STATUS` or `S` or `?` | Show current settings | `STATUS` |
+| `EXIT` or `X` or `Q` | Exit config mode and reconnect | `EXIT` |
+| `HELP` or `H` | Show command list | `HELP` |
+
+### BLE Threading Safety
+
+Callbacks only buffer data; processing happens in main loop:
+
+```cpp
+class RxCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) {
+        std::string rxValue = pCharacteristic->getValue();
+        // Buffer characters until newline
+        for (size_t i = 0; i < rxValue.length(); i++) {
+            char c = rxValue[i];
+            if (c == '\n' || c == '\r') {
+                if (bleRxBuffer.length() > 0 && bleCmdReady.length() == 0) {
+                    bleCmdReady = bleRxBuffer;  // Ready for main loop
+                    bleRxBuffer = "";
+                }
+            } else {
+                bleRxBuffer += c;
+            }
+        }
+    }
+};
+
+// In loop():
+if (bleCmdReady.length() > 0) {
+    processSetupCommand(bleCmdReady);
+    bleCmdReady = "";
+}
+```
+
+---
+
+## Persistent Storage
+
+### Preferences (NVS) Configuration
+
+**Namespace**: `"printer"`
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `mac` | 6 bytes | Printer Bluetooth MAC address |
+| `type` | uint8_t | Printer type (0=THERMAL, 1=DOT) |
+
+### Persistence Behavior
+
+| Action | Settings Preserved? |
+|--------|---------------------|
+| Reboot | Yes |
+| Firmware flash | Yes |
+| Full flash erase (`esptool erase_flash`) | No |
+
+### Load/Save Functions
+
+```cpp
+void loadPrinterMac() {
+    preferences.begin("printer", true);  // Read-only
+    if (preferences.isKey("mac")) {
+        preferences.getBytes("mac", printerBtAddress, 6);
+    }
+    preferences.end();
+}
+
+void savePrinterMac() {
+    preferences.begin("printer", false);  // Read-write
+    preferences.putBytes("mac", printerBtAddress, 6);
+    preferences.end();
+}
+
+void loadPrinterType() {
+    preferences.begin("printer", true);
+    if (preferences.isKey("type")) {
+        printerType = preferences.getUChar("type", 0);
+    }
+    preferences.end();
+}
+
+void savePrinterType() {
+    preferences.begin("printer", false);
+    preferences.putUChar("type", printerType);
+    preferences.end();
+}
 ```
 
 ---
@@ -573,56 +583,29 @@ void loop() {
                                   │
                                   ▼
                          ┌─────────────────┐
-                         │ Serial.begin    │
-                         │ (9600)          │  ← Debug output
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │ Serial1.begin   │
-                         │ (9600, RX=16)   │  ← UART from Hub
+                         │ Load settings   │
+                         │ from NVS        │  ← loadPrinterMac(), loadPrinterType()
                          └────────┬────────┘
                                   │
                                   ▼
                          ┌─────────────────┐
                          │ pinMode         │
-                         │ BUTTON_PIN      │  ← INPUT_PULLUP
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │ ledcSetup()     │
-                         │ ledcAttachPin() │  ← Configure PWM for LED
-                         │ ledcWrite(0)    │  ← LED off initially
+                         │ BUTTON (17)     │  ← INPUT_PULLUP
+                         │ LED (5)         │  ← OUTPUT, initially OFF
                          └────────┬────────┘
                                   │
                                   ▼
                          ┌─────────────────┐
                          │ SerialBT.begin  │
-                         │ (Master mode)   │  ← Initialize Bluetooth
+                         │ (Master mode)   │  ← Initialize Bluetooth Classic
                          └────────┬────────┘
                                   │
                                   ▼
                          ┌─────────────────┐
-                         │ SerialBT.setPin │
-                         │ ("0000")        │  ← Set pairing PIN
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │ SerialBT.connect│
-                         │ (printerMAC)    │  ← Connect to printer
-                         └────────┬────────┘
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │ Success                   │ Failure
-                    ▼                           ▼
-           ┌─────────────────┐         ┌─────────────────┐
-           │ btConnected=true│         │ btConnected=    │
-           │ LED = BRIGHTNESS│         │   false         │
-           └─────────────────┘         │ LED = OFF       │
-                                       │ (retry in loop) │
-                                       └─────────────────┘
+                         │ Ready!          │
+                         │ (No blocking    │  ← Connection handled by
+                         │  connect here)  │     background task in loop
+                         └─────────────────┘
 ```
 
 ### Main Loop Flow
@@ -634,164 +617,41 @@ void loop() {
                                   │
                                   ▼
                          ┌─────────────────┐
-                         │ Check Serial1   │
-                         │ .available()    │
+                         │ Check button    │
+                         │ for config mode │  ← 4 presses = toggle config
                          └────────┬────────┘
                                   │
                     ┌─────────────┴─────────────┐
-                    │ Data available            │ No data
-                    ▼                           │
-           ┌─────────────────┐                  │
-           │ Read line       │                  │
-           │ Serial1         │                  │
-           │ .readString     │                  │
-           │ Until('\n')     │                  │
-           └────────┬────────┘                  │
-                    │                           │
-                    ▼                           │
-           ┌─────────────────┐                  │
-           │ btConnected?    │                  │
-           └────────┬────────┘                  │
-                    │                           │
-         ┌──────────┴──────────┐                │
-         │ Yes                 │ No             │
-         ▼                     ▼                │
-┌─────────────────┐  ┌─────────────────┐        │
-│ printWith       │  │ Log "BT not    │        │
-│ Timestamp()     │  │  connected"    │        │
-└─────────────────┘  └─────────────────┘        │
+                    │ Config Mode               │ Normal Mode
+                    ▼                           ▼
+           ┌─────────────────┐         ┌─────────────────┐
+           │ Fast blink LED  │         │ Check Serial1   │
+           │ Process BLE cmd │         │ for data        │
+           │ Check exit flag │         │                 │
+           └─────────────────┘         └────────┬────────┘
                                                 │
-                    ┌───────────────────────────┘
-                    │
-                    ▼
-           ┌─────────────────┐
-           │ SerialBT        │
-           │ .connected(5000)│
-           └────────┬────────┘
-                    │
-         ┌──────────┴──────────┐
-         │ Connected           │ Not connected
-         ▼                     ▼
-┌─────────────────┐    ┌─────────────────┐
-│ If !btConnected │    │ If btConnected  │
-│ → Log reconnect │    │ → Log disconnect│
-│ → LED = ON      │    │ → LED = OFF     │
-│ → btConnected   │    │ → btConnected   │
-│   = true        │    │   = false       │
-└─────────────────┘    └────────┬────────┘
-                                │
-                                ▼
-                       ┌─────────────────┐
-                       │ reconnect       │
-                       │ Bluetooth()     │
-                       └─────────────────┘
-```
-
-### Reconnect Function Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      reconnectBluetooth()                                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │ Calculate       │
-                         │ elapsed time    │
-                         │ since last try  │
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │ Elapsed >= 5s?  │
-                         └────────┬────────┘
-                                  │
-               ┌──────────────────┴──────────────────┐
-               │ No (< 5s)                           │ Yes (>= 5s)
-               ▼                                     ▼
-      [Return immediately]                  ┌─────────────────┐
-                                            │ Update last     │
-                                            │ attempt time    │
-                                            └────────┬────────┘
-                                                     │
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │ Log "Attempting │
-                                            │  reconnect..."  │
-                                            └────────┬────────┘
-                                                     │
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │ SerialBT        │
-                                            │ .connect(MAC)   │
-                                            └────────┬────────┘
-                                                     │
-                                          ┌──────────┴──────────┐
-                                          │ Success             │ Failure
-                                          ▼                     ▼
-                                   ┌─────────────┐       [Return, try
-                                   │ btConnected │        again in 5s]
-                                   │ = true      │
-                                   │ LED = ON    │
-                                   │ Log success │
-                                   └─────────────┘
-```
-
-### Print Processing Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      printWithTimestamp(data)                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │ Convert to      │
-                         │ String, trim    │
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐     Yes
-                         │ Is filtered?    │──────────► [Return]
-                         │ (separator,     │
-                         │  signature,etc) │
-                         └────────┬────────┘
-                                  │ No
-                                  ▼
-                         ┌─────────────────┐     Yes
-                         │ Is "NO          │──────────► [Return silently]
-                         │  STABILITY"?    │
-                         └────────┬────────┘
-                                  │ No
-                                  ▼
-                         ┌─────────────────┐
-                         │ rtc.refresh()   │
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │ Read BUTTON_PIN │
-                         └────────┬────────┘
-                                  │
-               ┌──────────────────┴──────────────────┐
-               │ HIGH (bypass)                       │ LOW (full)
-               ▼                                     ▼
-      ┌─────────────────┐                   ┌─────────────────┐
-      │ Print weight    │                   │ Print timestamp │
-      │ only            │                   │ Print weight    │
-      └────────┬────────┘                   │ Print signature │
-               │                            │ Print separator │
-               │                            │ Paper feed      │
-               │                            └────────┬────────┘
-               │                                     │
-               └──────────────┬──────────────────────┘
-                              │
-                              ▼
-                     ┌─────────────────┐
-                     │ Blink LED (PWM) │
-                     │ OFF → delay →   │
-                     │ BRIGHTNESS      │
-                     └─────────────────┘
+                                                ▼
+                                       ┌─────────────────┐
+                                       │ If data &&      │
+                                       │ btConnected     │
+                                       │ → print         │
+                                       └────────┬────────┘
+                                                │
+                                                ▼
+                                       ┌─────────────────┐
+                                       │ Check BT status │
+                                       │ connected(0)    │  ← Non-blocking
+                                       └────────┬────────┘
+                                                │
+                                       ┌────────┴────────┐
+                                       │ Disconnected    │
+                                       ▼                 │
+                              ┌─────────────────┐        │
+                              │ reconnect       │        │
+                              │ Bluetooth()     │  ← Background task
+                              └─────────────────┘        │
+                                                         │
+                              [Continue loop] ◄──────────┘
 ```
 
 ---
@@ -801,53 +661,34 @@ void loop() {
 ### Compile-Time Constants
 
 ```cpp
-// Pin Definitions
-#define HUB_RX 16           // UART RX from Hub
-#define BUTTON_PIN 26       // Timestamp bypass button
-#define LED_PIN 25          // Status LED
+// Pin Definitions (remapped for swapped headers)
+#define HUB_RX 27           // UART RX from Hub (was GPIO 16)
+#define BUTTON_PIN 17       // Config/bypass button (was GPIO 26)
+#define LED_PIN 5           // Status LED (was GPIO 25)
 
-// PWM Settings
-#define LED_CHANNEL 0       // LEDC channel
-#define LED_FREQ 5000       // PWM frequency (Hz)
-#define LED_RESOLUTION 8    // 8-bit (0-255)
-#define LED_BRIGHTNESS 60   // ~25% brightness
+// BLE Nordic UART Service
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-// Bluetooth
-uint8_t printerBtAddress[6] = {0xDC, 0x0D, 0x30, 0x00, 0x28, 0x89};
-const char* btPin = "0000";
-
-// RTC
-#define RTC_ADDRESS 0x68    // DS3231 I2C address
+// Button timing
+const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long PRESS_TIMEOUT = 4000;  // 4 seconds for 4 presses
 ```
 
-### Day Names Array
+### Runtime Variables
 
 ```cpp
-const char* daysOfTheWeek[7] = {
-    "Sunday",     // Index 0 (dayOfWeek = 1)
-    "Monday",     // Index 1 (dayOfWeek = 2)
-    "Tuesday",    // Index 2 (dayOfWeek = 3)
-    "Wednesday",  // Index 3 (dayOfWeek = 4)
-    "Thursday",   // Index 4 (dayOfWeek = 5)
-    "Friday",     // Index 5 (dayOfWeek = 6)
-    "Saturday"    // Index 6 (dayOfWeek = 7)
-};
+// Bluetooth (loaded from NVS)
+uint8_t printerBtAddress[6] = {0xDC, 0x0D, 0x30, 0x00, 0x28, 0x89};
+uint8_t printerType = 0;  // 0=THERMAL, 1=DOT
+const char* btPin = "0000";
 
-// Usage: daysOfTheWeek[rtc.dayOfWeek() - 1]
-```
-
-### Configuring Bluetooth MAC Address
-
-To find your printer's MAC address:
-
-1. **Android**: Settings → Bluetooth → Paired devices → Tap printer → View details
-2. **Windows**: Device Manager → Bluetooth → Printer properties
-3. **ESP32 Scan**: Use `SerialBT.discover()` to scan nearby devices
-
-**Format Conversion**:
-```
-Display:  DC:0D:30:00:28:89
-Code:     {0xDC, 0x0D, 0x30, 0x00, 0x28, 0x89}
+// State
+bool btConnected = false;
+bool reconnectInProgress = false;
+bool configMode = false;
+bool bleExitRequested = false;
 ```
 
 ---
@@ -858,82 +699,88 @@ Code:     {0xDC, 0x0D, 0x30, 0x00, 0x28, 0x89}
 
 | LED State | Meaning | Action |
 |-----------|---------|--------|
-| OFF at startup | Bluetooth failed to connect | Check printer power, MAC address |
-| Solid ON | Normal operation | None |
+| OFF | Not connected to printer | Wait for auto-reconnect |
+| Solid ON | Connected to printer | Normal operation |
+| Fast blink (100ms) | Config mode active | Use BLE app to configure |
 | Brief OFF then ON | Print sent successfully | None |
-| OFF during operation | Bluetooth disconnected | Wait for auto-reconnect |
 
 ### Common Issues
 
 #### 1. Bluetooth Won't Connect
 
-**Symptoms**: LED stays OFF, serial shows "BT failed"
-
 **Solutions**:
-- Verify printer is powered ON and in pairing mode
-- Confirm MAC address is correct
-- Check PIN code matches printer settings
+- Verify printer is powered ON
+- Check MAC address via BLE config (`STATUS` command)
+- Update MAC via BLE (`MAC XX:XX:XX:XX:XX:XX`)
 - Ensure printer isn't connected to another device
 - Power cycle both ESP32 and printer
 
-#### 2. Garbled Print Output
+#### 2. Button Not Responding
 
-**Symptoms**: Printed text is corrupted or has wrong characters
+**Check**:
+- Button is latched type (toggle switch), not momentary
+- Wiring: one terminal to GPIO 17, other to GND
+- INPUT_PULLUP is configured (reads HIGH when not pressed)
 
-**Solutions**:
-- Verify baud rates match (9600)
-- Check for loose UART connections
-- Ensure Hub and Printer ESP32 share common GND
+#### 3. Config Mode Entry
 
-#### 3. No Timestamp on Prints
-
-**Symptoms**: Weight prints but no date/time
-
-**Solutions**:
-- Check RTC module wiring (SDA/SCL)
-- Verify RTC has battery backup
-- Check if button is stuck pressed (bypass mode)
+**To enter config mode**:
+1. Press button 4 times within 4 seconds
+2. LED should start fast blinking
+3. Connect with LightBlue or nRF Connect app
+4. Look for "PrinterConfig" device
+5. Find Nordic UART service and subscribe to TX characteristic
 
 #### 4. RTC Shows Wrong Time
 
-**Solutions**:
-- Program RTC with current time once:
-```cpp
-// In setup(), run once then comment out:
-rtc.set(0, 30, 14, 5, 12, 12, 25);  // sec, min, hr, dow, day, month, year
+**Set time via BLE**:
 ```
+TIME 25/01/17 14:30:00 6
+```
+Format: `TIME YY/MM/DD HH:MM:SS DOW` (DOW = day of week, 1=Sunday to 7=Saturday)
 
-#### 5. Prints Missing or Duplicated
+#### 5. Wrong Paper Feed Amount
 
-**Symptoms**: Some prints don't appear, or print multiple times
-
-**Solutions**:
-- Check UART connection integrity
-- Verify Hub is sending data correctly
-- Add debounce delay if needed
+**Set printer type via BLE**:
+- For thermal printer: `TYPE THERMAL` (feeds 3 lines)
+- For dot matrix: `TYPE DOT` (feeds 12 lines)
 
 ### Debug Output Reference
 
 **Normal Startup**:
 ```
+Printer MAC: DC:0D:30:00:28:89
+Printer Type: THERMAL
+
 ===== Printer ESP32 =====
 UART RX from Hub + Bluetooth TX to Printer
 ==========================
 
-Connecting to Bluetooth printer...
-Bluetooth connected!
 Printer ESP32 ready!
+Will connect to printer in background...
 ```
 
-**Print Received**:
+**Config Mode Entry**:
 ```
->>> Print data received:  *     123.45 g
+Button press: 1
+Button press: 2
+Button press: 3
+Button press: 4
+
+===== ENTERING CONFIG MODE =====
+BLE UART server started, advertising...
+BLE Started: PrinterConfig
 ```
 
-**Bluetooth Reconnection**:
+**BLE Command Processing**:
 ```
-BT reconnecting...
-BT reconnected!
+[BLE] Client connected
+[BLE CMD] STATUS
+=== PrinterConfig Status ===
+TIME: 25/01/17 14:30:00 6
+MAC: DC:0D:30:00:28:89
+TYPE: THERMAL
+============================
 ```
 
 ---
@@ -945,7 +792,9 @@ BT reconnected!
 | Library | Version | Purpose |
 |---------|---------|---------|
 | BluetoothSerial | Built-in | Bluetooth Classic SPP |
+| BLEDevice, BLEServer, BLEUtils, BLE2902 | Built-in | BLE Nordic UART Service |
 | Wire | Built-in | I2C communication |
+| Preferences | Built-in | NVS persistent storage |
 | uRTCLib | 6.2.7+ | DS3231 RTC interface |
 
 ### PlatformIO Configuration
@@ -953,15 +802,15 @@ BT reconnected!
 ```ini
 [env:esp32dev]
 platform = espressif32
-board = esp32dev
+board = esp32doit-devkit-v1
 framework = arduino
 monitor_speed = 9600
 upload_speed = 921600
 
-lib_deps = 
+lib_deps =
     naguissa/uRTCLib@^6.2.7
 
-build_flags = 
+build_flags =
     -D CORE_DEBUG_LEVEL=0
 ```
 
@@ -969,7 +818,7 @@ build_flags =
 
 ## Appendix: Complete Print Output Examples
 
-### Example 1: Full Receipt Mode
+### Example 1: Full Receipt Mode (THERMAL)
 
 **Input from Hub**: ` *     123.45 g`
 
@@ -981,27 +830,41 @@ Signature
 
 ------------------------
 ........................
-
+[3 line feed]
 ```
 
-### Example 2: Bypass Mode
+### Example 2: Full Receipt Mode (DOT)
+
+**Input from Hub**: ` *     123.45 g`
+
+**Printed Output**:
+```
+12/12/2025 (Thursday) 14:30:45
+ *     123.45 g
+Signature
+
+------------------------
+........................
+[12 line feed]
+```
+
+### Example 3: Bypass Mode
 
 **Input from Hub**: ` *     123.45 g`
 
 **Printed Output**:
 ```
  *     123.45 g
+[buffer flush, no feed]
 ```
 
-### Example 3: Instability Warning
+### Example 4: Instability Warning
 
 **Input from Hub**: `NO STABILITY`
 
 **Printed Output**: *(No output - silently ignored)*
 
-**Note**: Unstable readings are filtered to prevent printing incomplete weighments.
-
 ---
 
-*Document generated for Printer ESP32*
-*Compatible with Hub ESP32 v3.2*
+*Document updated: January 2025*
+*Firmware version with BLE config mode, FreeRTOS reconnect, printer type support*
